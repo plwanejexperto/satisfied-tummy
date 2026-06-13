@@ -1,4 +1,5 @@
 import os
+import re
 import requests
 import math
 import googlemaps
@@ -56,164 +57,99 @@ def get_place_price_range(place_id, api_key):
 	else:
 		return None
 		
-def _haversine_m(lat1, lon1, lat2, lon2):
-	R = 6371000.0
-	φ1, φ2 = math.radians(lat1), math.radians(lat2)
-	Δφ = math.radians(lat2 - lat1)
-	Δλ = math.radians(lon2 - lon1)
-	a = math.sin(Δφ/2)**2 + math.cos(φ1)*math.cos(φ2)*math.sin(Δλ/2)**2
-	c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
-	return int(R * c)
-
 def get_nearest_mrts(lat, lng, api_key, radius=2000, max_results=3, debug=False, timeout=8):
-	"""
-	Robust MRT lookup:
-	- Tries legacy Nearby Search with several keywords/types
-	- Falls back to rankby=distance search
-	- Falls back to Places API v1 searchNearby (POST)
-	Returns list like ["Dhoby Ghaut MRT (120 m)", ...] or [] if none
-	"""
-	if not api_key:
-		if debug: print("No API key provided")
-		return []
-
-	if lat is None or lng is None:
-		if debug: print("Invalid lat/lng:", lat, lng)
-		return []
-
-	# Helper to parse legacy NearbySearch results
-	def _parse_legacy_results(data):
-		out = []
-		for r in data.get("results", [])[:max_results]:
-			name = r.get("name") or r.get("vicinity") or r.get("formatted_address") or "Unknown"
-			# compute distance if geometry available
-			geom = r.get("geometry", {}).get("location", {})
-			plat, plng = geom.get("lat"), geom.get("lng")
-			dist = None
-			if plat is not None and plng is not None:
+		if not api_key or lat is None or lng is None:
+			return []
+		
+		from math import radians, cos, sin, asin, sqrt
+		def _haversine_m(lat1, lon1, lat2, lon2):
+			R = 6371000
+			dlat = radians(lat2 - lat1)
+			dlon = radians(lon2 - lon1)
+			a = sin(dlat/2)**2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon/2)**2
+			c = 2 * asin(sqrt(a))
+			return R * c
+		
+		def _parse_results(data):
+			out = []
+			for r in data.get("results", []):
+				place_types = r.get("types", [])
+				name = r.get("name") or ""
+				geom = r.get("geometry", {}).get("location", {})
+				plat, plng = geom.get("lat"), geom.get("lng")
+				if plat is None or plng is None:
+					continue
 				dist = _haversine_m(lat, lng, plat, plng)
-			if dist is not None:
-				out.append(f"{name} ({dist} m)")
-			else:
-				out.append(name)
-		return out
+				# MRT filter
+				if ("subway_station" in place_types) or any(w in name.lower() for w in ["mrt", "station", "lrt"]):
+					out.append((name, dist))
+			return out
+		
+		def clean_mrt_results(results):
+			seen = {}
+			clean = []
+			
+			def normalize_name(name):
+				name = name.lower()
+				# Remove "Exit X"
+				name = re.sub(r"exit\s*\w+", "", name)
+				# Remove parentheses and their contents
+				name = re.sub(r"\(.*?\)", "", name)
+				# Remove common station suffixes
+				name = re.sub(r"\b(mrt|lrt|station)\b", "", name)
+				# Remove station codes like TE15
+				name = re.sub(r"\b[a-z]{1,3}\d{1,3}\b", "", name)
+				# Remove extra whitespace
+				name = re.sub(r"\s+", " ", name).strip()
+				return name
+			
+			for name, dist in results:
+				clean_name = normalize_name(name)
+				if clean_name not in seen or dist < seen[clean_name][1]:
+					seen[clean_name] = (clean_name.title(), dist)  # store cleaned name
+			
+			for v in seen.values():
+				clean.append(v)
+			return clean
 
-	# 1) Try multiple keyword/type combos (legacy places/nearbysearch)
-	legacy_url = "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
-	attempts = []
-	# keywords and types to try (order matters)
-	keywords = ["MRT station", "MRT", "subway station", "train station", "transit station", "Mass Rapid Transit"]
-	types = [None, "transit_station", "subway_station", "train_station"]
-	for kw in keywords:
-		for t in types:
+		
+		legacy_url = "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
+		all_results = []
+		
+		keywords = ["MRT station", "MRT/LRT Station", "subway_station", "transit_station"]
+		for kw in keywords:
 			params = {
 				"location": f"{lat},{lng}",
-				"radius": radius,
+				"rankby": "distance",
 				"keyword": kw,
 				"key": api_key
 			}
-			if t:
-				params["type"] = t
 			try:
 				resp = requests.get(legacy_url, params=params, timeout=timeout)
+				if resp.status_code == 200:
+					data = resp.json()
+					all_results.extend(_parse_results(data))
 			except Exception as e:
-				if debug: print("HTTP error:", e)
-				continue
-
-			if debug:
-				print("Legacy request", {"keyword": kw, "type": t, "status": resp.status_code})
-				# print small response preview
-				try:
-					preview = resp.json()
-					if "error_message" in preview:
-						print("Error message:", preview.get("error_message"))
-				except Exception:
-					print("Non-JSON response")
-
-			if resp.status_code != 200:
-				# keep trying other combos
-				continue
-
-			data = resp.json()
-			if data.get("status") not in ("OK", "ZERO_RESULTS"):
 				if debug:
-					print("Legacy unexpected status:", data.get("status"), data.get("error_message"))
-				continue
+					print(f"Rankby request failed for keyword '{kw}':", e)
+		# Remove "Vivocity Sentosa Express" explicitly
+		all_results = [r for r in all_results if "vivocity" not in r[0].lower()]
+		
+		# Sort by distance and deduplicate
+		all_results.sort(key=lambda x: x[1])
+		all_results = clean_mrt_results(all_results)
+		# Filter: MRT stations within 500m
+		mrts_within_500m = [f"{name} ({int(dist)} m)" for name, dist in all_results if dist <= 500]
+		
+		if mrts_within_500m:
+			return mrts_within_500m
+		elif all_results:
+			# Show only the nearest MRT if none within 500m
+			name, dist = all_results[0]
+			return [f"{name} ({int(dist)} m)"]
+		
+		return [f"{name} ({int(dist)} m)" for name, dist in all_results[:max_results]]
 
-			if data.get("results"):
-				return _parse_legacy_results(data)
-
-			# record attempt for debugging
-			attempts.append((kw, t, data.get("status")))
-
-	# 2) Try rankby=distance (legacy) - requires keyword or type, no radius param
-	try:
-		params = {
-			"location": f"{lat},{lng}",
-			"rankby": "distance",
-			"keyword": "MRT station",
-			"key": api_key
-		}
-		resp = requests.get(legacy_url, params=params, timeout=timeout)
-		if debug:
-			print("Rankby request status:", resp.status_code)
-		if resp.status_code == 200:
-			data = resp.json()
-			if data.get("results"):
-				return _parse_legacy_results(data)
-	except Exception as e:
-		if debug: print("Rankby request failed:", e)
-
-	# 3) Fallback: Places API v1 /places:searchNearby (POST)
-	try:
-		url_v1 = "https://places.googleapis.com/v1/places:searchNearby"
-		headers = {
-			"Content-Type": "application/json",
-			"X-Goog-Api-Key": api_key,
-			"X-Goog-FieldMask": "places.displayName,places.location,places.distanceMeters"
-		}
-		payload = {
-			"includedTypes": ["subway_station", "transit_station"],
-			"maxResultCount": max_results,
-			"rankPreference": "DISTANCE",
-			"locationRestriction": {
-				"circle": {
-					"center": {"latitude": lat, "longitude": lng},
-					"radius": radius
-				}
-			}
-		}
-		resp = requests.post(url_v1, headers=headers, json=payload, timeout=timeout)
-		if debug:
-			print("v1 searchNearby status:", resp.status_code)
-			# show message if not 200
-			if resp.status_code != 200:
-				try:
-					print("v1 response:", resp.json())
-				except Exception:
-					print("v1 non-json response")
-		if resp.status_code == 200:
-			data = resp.json()
-			places = data.get("places", [])
-			out = []
-			for p in places[:max_results]:
-				name = p.get("displayName", {}).get("text") or "Unknown"
-				dist = p.get("distanceMeters")
-				if dist is None:
-					loc = p.get("location", {}).get("latLng", {})
-					plat = loc.get("latitude"); plng = loc.get("longitude")
-					if plat is not None and plng is not None:
-						dist = _haversine_m(lat, lng, plat, plng)
-				out.append(f"{name} ({int(dist)} m)" if dist is not None else name)
-			if out:
-				return out
-	except Exception as e:
-		if debug: print("v1 request error:", e)
-
-	# nothing found
-	if debug:
-		print("All attempts exhausted. Attempts summary:", attempts)
-	return []
 
 def get_opening_hours(place_id, api_key):
 		url = f"https://places.googleapis.com/v1/places/{place_id}"
@@ -228,6 +164,17 @@ def get_opening_hours(place_id, api_key):
 		data = r.json().get("regularOpeningHours", {}).get("weekdayDescriptions", [])
 		return data
 
+def get_place_details(place_id, api_key):
+		url = f"https://places.googleapis.com/v1/places/{place_id}"
+		headers = {
+			"Content-Type": "application/json",
+			"X-Goog-Api-Key": api_key,
+			"X-Goog-FieldMask": "reservable"
+		}
+		r = requests.get(url, headers=headers)
+		if r.status_code != 200:
+			return None
+		return r.json().get("reservable")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 	await update.message.reply_text(
@@ -324,18 +271,25 @@ async def search_restaurant(update: Update, context: ContextTypes.DEFAULT_TYPE):
 			lng = loc.get("longitude")
 		mrt_names = get_nearest_mrts(lat, lng, GOOGLE_API_KEY) if lat and lng else []
 		mrt_text = ", ".join(mrt_names) if mrt_names else "Unknown"
+		
+		reservations = get_place_details(place["id"], GOOGLE_API_KEY)
+		if reservations is None:
+			reservations_text = "Unknown"
+		else:
+			reservations_text = "Yes" if reservations else "No"
 	
 		reply_text += f"\n--- Details for result {idx+1} ---\n"
-		reply_text += f"Name: {name}\n"
-		reply_text += f"Address: {addr}\n"
-		reply_text += f"Type: {', '.join(types)}\n"
-		reply_text += f"Rating: {rating}\n"
-		reply_text += f"Estimated price per pax: {est_price}\n"
-		reply_text += f"Nearest MRT(s): {mrt_text}\n"
-		reply_text += f"Link: {maps_url}\n"
+		reply_text += f"Name 🏷️: {name}\n"
+		reply_text += f"Address 📍: {addr}\n"
+		reply_text += f"Type 🍽️: {', '.join(types)}\n"
+		reply_text += f"Rating ⭐: {rating}\n"
+		reply_text += f"Estimated price per pax 💰: {est_price}\n"
+		reply_text += f"Nearest MRT/LRT(s) 🚇: {mrt_text}\n"
+		reply_text += f"Reservations available 📅: {reservations_text}\n"
+		reply_text += f"Link 🔗: {maps_url}\n"
 		hours = get_opening_hours(place["id"], GOOGLE_API_KEY)
 		if hours:
-			reply_text += "Opening Hours:\n"
+			reply_text += "Opening Hours ⏰:\n"
 			for h in hours:
 				reply_text += f"  {h}\n"
 	

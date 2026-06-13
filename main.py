@@ -1,8 +1,6 @@
 import os
 import re
 import requests
-import math
-import googlemaps
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler, ConversationHandler
 from telegram.helpers import escape_markdown
@@ -11,8 +9,8 @@ from datetime import datetime
 from pymongo.mongo_client import MongoClient
 from pymongo.server_api import ServerApi
 import certifi
-from db import restaurants_collection
 from bson import ObjectId
+import logging
 
 load_dotenv()
 
@@ -21,9 +19,11 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 
 # --- MongoDB Connection ---
 MONGO_URI = os.getenv("MONGO_URI")
-client = MongoClient(MONGO_URI, tlsCAFile=certifi.where(), server_api=ServerApi('1'))
+client = MongoClient(MONGO_URI, tlsCAFile=certifi.where())
 db = client["satisfiedTummy"]
 restaurants_collection = db["restaurants"]
+
+logging.basicConfig(level=logging.INFO)
 
 # --- DB Connectivity Test ---
 def test_database_connection():
@@ -39,11 +39,6 @@ def test_database_connection():
 	print()
 
 test_database_connection()
-
-def escape_md_v2(text: str) -> str:
-	# Escape all characters that MarkdownV2 considers special
-	escape_chars = r"_*[]()~`>#+-=|{}.!\\"
-	return re.sub(f"([{re.escape(escape_chars)}])", r"\\\1", text)
 
 def estimate_price_per_pax(price_level):
 	mapping = {
@@ -61,59 +56,59 @@ def reorder_opening_hours(weekday_text):
 	return weekday_text[today_index:] + weekday_text[:today_index]
 		
 def get_nearest_mrts(lat, lng, api_key, radius=2000, max_results=3, debug=False, timeout=8):
-		if not pi_key or lat is None or lng is None:
-			return []
+	if not api_key or lat is None or lng is None:
+		return []
+	
+	from math import radians, cos, sin, asin, sqrt
+	def _haversine_m(lat1, lon1, lat2, lon2):
+		R = 6371000
+		dlat = radians(lat2 - lat1)
+		dlon = radians(lon2 - lon1)
+		a = sin(dlat/2)**2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon/2)**2
+		c = 2 * asin(sqrt(a))
+		return R * c
+	
+	def _parse_results(data):
+		out = []
+		for r in data.get("results", []):
+			place_types = r.get("types", [])
+			name = r.get("name") or ""
+			geom = r.get("geometry", {}).get("location", {})
+			plat, plng = geom.get("lat"), geom.get("lng")
+			if plat is None or plng is None:
+				continue
+			dist = _haversine_m(lat, lng, plat, plng)
+			# MRT filter
+			if ("subway_station" in place_types) or any(w in name.lower() for w in ["mrt", "station", "lrt"]):
+				out.append((name, dist))
+		return out
+	
+	def clean_mrt_results(results):
+		seen = {}
+		clean = []
 		
-		from math import radians, cos, sin, asin, sqrt
-		def _haversine_m(lat1, lon1, lat2, lon2):
-			R = 6371000
-			dlat = radians(lat2 - lat1)
-			dlon = radians(lon2 - lon1)
-			a = sin(dlat/2)**2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon/2)**2
-			c = 2 * asin(sqrt(a))
-			return R * c
+		def normalize_name(name):
+			name = name.lower()
+			# Remove "Exit X"
+			name = re.sub(r"exit\s*\w+", "", name)
+			# Remove parentheses and their contents
+			name = re.sub(r"\(.*?\)", "", name)
+			# Remove common station suffixes
+			name = re.sub(r"\b(mrt|lrt|station)\b", "", name)
+			# Remove station codes like TE15
+			name = re.sub(r"\b[a-z]{1,3}\d{1,3}\b", "", name)
+			# Remove extra whitespace
+			name = re.sub(r"\s+", " ", name).strip()
+			return name
 		
-		def _parse_results(data):
-			out = []
-			for r in data.get("results", []):
-				place_types = r.get("types", [])
-				name = r.get("name") or ""
-				geom = r.get("geometry", {}).get("location", {})
-				plat, plng = geom.get("lat"), geom.get("lng")
-				if plat is None or plng is None:
-					continue
-				dist = _haversine_m(lat, lng, plat, plng)
-				# MRT filter
-				if ("subway_station" in place_types) or any(w in name.lower() for w in ["mrt", "station", "lrt"]):
-					out.append((name, dist))
-			return out
+		for name, dist in results:
+			clean_name = normalize_name(name)
+			if clean_name not in seen or dist < seen[clean_name][1]:
+				seen[clean_name] = (clean_name.title(), dist)  # store cleaned name
 		
-		def clean_mrt_results(results):
-			seen = {}
-			clean = []
-			
-			def normalize_name(name):
-				name = name.lower()
-				# Remove "Exit X"
-				name = re.sub(r"exit\s*\w+", "", name)
-				# Remove parentheses and their contents
-				name = re.sub(r"\(.*?\)", "", name)
-				# Remove common station suffixes
-				name = re.sub(r"\b(mrt|lrt|station)\b", "", name)
-				# Remove station codes like TE15
-				name = re.sub(r"\b[a-z]{1,3}\d{1,3}\b", "", name)
-				# Remove extra whitespace
-				name = re.sub(r"\s+", " ", name).strip()
-				return name
-			
-			for name, dist in results:
-				clean_name = normalize_name(name)
-				if clean_name not in seen or dist < seen[clean_name][1]:
-					seen[clean_name] = (clean_name.title(), dist)  # store cleaned name
-			
-			for v in seen.values():
-				clean.append(v)
-			return clean
+		for v in seen.values():
+			clean.append(v)
+		return clean
 
 		
 		legacy_url = "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
@@ -155,83 +150,83 @@ def get_nearest_mrts(lat, lng, api_key, radius=2000, max_results=3, debug=False,
 
 
 def get_opening_hours(place_id, api_key):
-		url = f"https://places.googleapis.com/v1/places/{place_id}"
-		headers = {
-			"Content-Type": "application/json",
-			"X-Goog-Api-Key": api_key,
-			"X-Goog-FieldMask": "regularOpeningHours.weekdayDescriptions"
-		}
-		r = requests.get(url, headers=headers)
-		if r.status_code != 200:
-			return []
-		data = r.json().get("regularOpeningHours", {}).get("weekdayDescriptions", [])
-		return data
+	url = f"https://places.googleapis.com/v1/places/{place_id}"
+	headers = {
+		"Content-Type": "application/json",
+		"X-Goog-Api-Key": api_key,
+		"X-Goog-FieldMask": "regularOpeningHours.weekdayDescriptions"
+	}
+	r = requests.get(url, headers=headers)
+	if r.status_code != 200:
+		return []
+	data = r.json().get("regularOpeningHours", {}).get("weekdayDescriptions", [])
+	return data
 
 def format_opening_hours(opening_hours) -> str:
-		import re
-		
-		weekdays = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-		
-		# Convert list like ["Monday: 8AM–5PM", ...] → dict
-		if isinstance(opening_hours, list):
-			hours_dict = {}
-			for entry in opening_hours:
-				match = re.match(r"(?i)(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\s*[:\-]?\s*(.+)", entry.strip())
-				if match:
-					hours_dict[match.group(1).capitalize()] = match.group(2).strip()
-		else:
-			hours_dict = dict(opening_hours)
-		
-		# Normalize values by removing day prefixes carefully
-		cleaned = {}
-		for day in weekdays:
-			val = hours_dict.get(day, "Unknown")
-			val = re.sub(rf"^{day}\s*[:\-]?\s*", "", val.strip(), flags=re.IGNORECASE)
-			cleaned[day] = val.strip()
-		
-		hours_list = [cleaned.get(day, "Unknown") for day in weekdays]
-		
-		# Case 1: all same hours → "Daily: ..."
-		if all(h == hours_list[0] for h in hours_list):
-			return f"    Daily: {hours_list[0]}"
-		
-		# Case 2: group consecutive days with same hours
-		grouped = []
-		start_day = weekdays[0]
-		prev_hours = hours_list[0]
-		
-		for i in range(1, 7):
-			current_hours = hours_list[i]
-			if current_hours != prev_hours:
-				end_day = weekdays[i - 1]
-				if start_day == end_day:
-					grouped.append(f"{start_day}: {prev_hours}")
-				else:
-					grouped.append(f"{start_day} - {end_day}: {prev_hours}")
-				start_day = weekdays[i]
-				prev_hours = current_hours
-		
-		# Add last group
-		end_day = weekdays[6]
-		if start_day == end_day:
-			grouped.append(f"{start_day}: {prev_hours}")
-		else:
-			grouped.append(f"{start_day} - {end_day}: {prev_hours}")
-		
-		return "\n".join([f"    {line}" for line in grouped])
+	import re
+	
+	weekdays = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+	
+	# Convert list like ["Monday: 8AM–5PM", ...] → dict
+	if isinstance(opening_hours, list):
+		hours_dict = {}
+		for entry in opening_hours:
+			match = re.match(r"(?i)(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\s*[:\-]?\s*(.+)", entry.strip())
+			if match:
+				hours_dict[match.group(1).capitalize()] = match.group(2).strip()
+	else:
+		hours_dict = dict(opening_hours)
+	
+	# Normalize values by removing day prefixes carefully
+	cleaned = {}
+	for day in weekdays:
+		val = hours_dict.get(day, "Unknown")
+		val = re.sub(rf"^{day}\s*[:\-]?\s*", "", val.strip(), flags=re.IGNORECASE)
+		cleaned[day] = val.strip()
+	
+	hours_list = [cleaned.get(day, "Unknown") for day in weekdays]
+	
+	# Case 1: all same hours → "Daily: ..."
+	if all(h == hours_list[0] for h in hours_list):
+		return f"    Daily: {hours_list[0]}"
+	
+	# Case 2: group consecutive days with same hours
+	grouped = []
+	start_day = weekdays[0]
+	prev_hours = hours_list[0]
+	
+	for i in range(1, 7):
+		current_hours = hours_list[i]
+		if current_hours != prev_hours:
+			end_day = weekdays[i - 1]
+			if start_day == end_day:
+				grouped.append(f"{start_day}: {prev_hours}")
+			else:
+				grouped.append(f"{start_day} - {end_day}: {prev_hours}")
+			start_day = weekdays[i]
+			prev_hours = current_hours
+	
+	# Add last group
+	end_day = weekdays[6]
+	if start_day == end_day:
+		grouped.append(f"{start_day}: {prev_hours}")
+	else:
+		grouped.append(f"{start_day} - {end_day}: {prev_hours}")
+	
+	return "\n".join([f"    {line}" for line in grouped])
 
 
 def get_place_details(place_id, api_key):
-		url = f"https://places.googleapis.com/v1/places/{place_id}"
-		headers = {
-			"Content-Type": "application/json",
-			"X-Goog-Api-Key": api_key,
-			"X-Goog-FieldMask": "reservable"
-		}
-		r = requests.get(url, headers=headers)
-		if r.status_code != 200:
-			return None
-		return r.json().get("reservable")
+	url = f"https://places.googleapis.com/v1/places/{place_id}"
+	headers = {
+		"Content-Type": "application/json",
+		"X-Goog-Api-Key": api_key,
+		"X-Goog-FieldMask": "reservable"
+	}
+	r = requests.get(url, headers=headers)
+	if r.status_code != 200:
+		return None
+	return r.json().get("reservable")
 
 # --- TELEGRAM HANDLERS ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -307,11 +302,17 @@ async def search_restaurant(update: Update, context: ContextTypes.DEFAULT_TYPE):
 		return ConversationHandler.END
 	
 	relevant_types = {"restaurant", "cafe", "bakery", "bar", "meal_takeaway", "fast_food"}
-	filtered_results = [
-		p for p in results 
-		if any(t in relevant_types for t in p.get("types", []))
-		and p.get("displayName", {}).get("text")
-	]
+	filtered_results = []
+	for place in results:
+		types = place.get("types", [])
+		has_relevant_type = False
+		for t in types:
+			if t in relevant_types:
+				has_relevant_type = True
+				break
+		has_name = place.get("displayName", {}).get("text")
+		if has_relevant_type and has_name:
+			filtered_results.append(place)
 	if not filtered_results:
 		await update.message.reply_text("No relevant restaurants found in Singapore.")
 		return ConversationHandler.END
@@ -328,7 +329,7 @@ async def search_restaurant(update: Update, context: ContextTypes.DEFAULT_TYPE):
 		rating = place.get("rating", "Unknown")
 		price_level = place.get("priceLevel", 0)
 		price_range = place.get("priceRange", {})
-	
+		
 		if price_range:
 			start = price_range.get("startPrice", {}).get("units")
 			end = price_range.get("endPrice", {}).get("units")
@@ -559,28 +560,31 @@ async def list_restaurants(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def search_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
-	if not context.args:
+	if not context.args: #when user does not enter a keyword
 		await update.message.reply_text("Usage: /searchdb <keyword>")
 		return
 	
-	keyword = " ".join(context.args).lower()
-	query = {
+	#if user types /searchdb sushi bar, context.args = ["sushi", "bar"]. need to merge lst into 1 string
+	keyword = " ".join(context.args).lower() 
+	query = { #search for the keyword in name, tags, type fields
 		"$or": [
-			{"name": {"$regex": keyword, "$options": "i"}},
-			{"tags": {"$regex": keyword, "$options": "i"}},
+			{"name": {"$regex": keyword, "$options": "i"}}, #"$regex": match strings by patterns (eg. dev --> developer, device etc.)
+			{"tags": {"$regex": keyword, "$options": "i"}}, #"$options": "i" means case insensitive
 			{"type": {"$regex": keyword, "$options": "i"}},
 		]
 	}
 	results = list(restaurants_collection.find(query))
 	
-	if not results:
+	if not results: #list is empty --> no results
 		await update.message.reply_text(f"No restaurants found for '{keyword}'.")
 		return
 	
 	restaurant_blocks = []  # <-- list of blocks, one per restaurant
 	for r in results:
 		name = escape_markdown(r.get('name', 'Unnamed'), version=2)
-		types = ", ".join(escape_markdown(t, version=2) for t in r.get('type', []))
+		escaped_t = escape_markdown(t, version=2)
+		types_list = r.get('type', [])
+		types = ", ".join(escaped_t for t in types_list) #escaped_t for t in types_list means all escaped strings, ", ".join means join with comma and space
 		rating = escape_markdown(str(r.get('rating', 'Unknown')), version=2)
 		price = escape_markdown(r.get('price_per_pax', 'Unknown'), version=2)
 		mrts = ", ".join(escape_markdown(m, version=2) for m in r.get('nearest_mrts', []))
@@ -594,7 +598,6 @@ async def search_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
 			f"  *Nearest MRTs:* {mrts}\n"
 			f"  *Reservations:* {reservations}\n"
 		)
-	
 		opening_hours = r.get('opening_hours', {})
 		if opening_hours:
 			simplified_hours = format_opening_hours(opening_hours)
@@ -645,7 +648,11 @@ app.add_handler(CommandHandler("cancel", cancel))
 
 print("🤖 Bot running...")
 
-import logging
 logging.basicConfig(level=logging.INFO)
 
 app.run_polling()
+
+
+#Random python syntax 
+
+#dictionary.get(key_defaultvalue) --> returns value of key (if key exists), if key does not exist, returns default value

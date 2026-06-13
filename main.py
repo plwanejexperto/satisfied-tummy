@@ -1,5 +1,6 @@
 import os
 import requests
+import math
 import googlemaps
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
@@ -54,17 +55,126 @@ def get_place_price_range(place_id, api_key):
 		return f"Up to ${end_price}"
 	else:
 		return None
+		
+def _haversine_m(lat1, lon1, lat2, lon2):
+	R = 6371000.0
+	φ1, φ2 = math.radians(lat1), math.radians(lat2)
+	Δφ = math.radians(lat2 - lat1)
+	Δλ = math.radians(lon2 - lon1)
+	a = math.sin(Δφ/2)**2 + math.cos(φ1)*math.cos(φ2)*math.sin(Δλ/2)**2
+	c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+	return int(R * c)
 
-def get_nearest_mrts(lat, lng, api_key, radius=1000):
-		url = "https://places.googleapis.com/v1/places:searchNearby"
+def get_nearest_mrts(lat, lng, api_key, radius=2000, max_results=3, debug=False, timeout=8):
+	"""
+	Robust MRT lookup:
+	- Tries legacy Nearby Search with several keywords/types
+	- Falls back to rankby=distance search
+	- Falls back to Places API v1 searchNearby (POST)
+	Returns list like ["Dhoby Ghaut MRT (120 m)", ...] or [] if none
+	"""
+	if not api_key:
+		if debug: print("No API key provided")
+		return []
+
+	if lat is None or lng is None:
+		if debug: print("Invalid lat/lng:", lat, lng)
+		return []
+
+	# Helper to parse legacy NearbySearch results
+	def _parse_legacy_results(data):
+		out = []
+		for r in data.get("results", [])[:max_results]:
+			name = r.get("name") or r.get("vicinity") or r.get("formatted_address") or "Unknown"
+			# compute distance if geometry available
+			geom = r.get("geometry", {}).get("location", {})
+			plat, plng = geom.get("lat"), geom.get("lng")
+			dist = None
+			if plat is not None and plng is not None:
+				dist = _haversine_m(lat, lng, plat, plng)
+			if dist is not None:
+				out.append(f"{name} ({dist} m)")
+			else:
+				out.append(name)
+		return out
+
+	# 1) Try multiple keyword/type combos (legacy places/nearbysearch)
+	legacy_url = "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
+	attempts = []
+	# keywords and types to try (order matters)
+	keywords = ["MRT station", "MRT", "subway station", "train station", "transit station", "Mass Rapid Transit"]
+	types = [None, "transit_station", "subway_station", "train_station"]
+	for kw in keywords:
+		for t in types:
+			params = {
+				"location": f"{lat},{lng}",
+				"radius": radius,
+				"keyword": kw,
+				"key": api_key
+			}
+			if t:
+				params["type"] = t
+			try:
+				resp = requests.get(legacy_url, params=params, timeout=timeout)
+			except Exception as e:
+				if debug: print("HTTP error:", e)
+				continue
+
+			if debug:
+				print("Legacy request", {"keyword": kw, "type": t, "status": resp.status_code})
+				# print small response preview
+				try:
+					preview = resp.json()
+					if "error_message" in preview:
+						print("Error message:", preview.get("error_message"))
+				except Exception:
+					print("Non-JSON response")
+
+			if resp.status_code != 200:
+				# keep trying other combos
+				continue
+
+			data = resp.json()
+			if data.get("status") not in ("OK", "ZERO_RESULTS"):
+				if debug:
+					print("Legacy unexpected status:", data.get("status"), data.get("error_message"))
+				continue
+
+			if data.get("results"):
+				return _parse_legacy_results(data)
+
+			# record attempt for debugging
+			attempts.append((kw, t, data.get("status")))
+
+	# 2) Try rankby=distance (legacy) - requires keyword or type, no radius param
+	try:
+		params = {
+			"location": f"{lat},{lng}",
+			"rankby": "distance",
+			"keyword": "MRT station",
+			"key": api_key
+		}
+		resp = requests.get(legacy_url, params=params, timeout=timeout)
+		if debug:
+			print("Rankby request status:", resp.status_code)
+		if resp.status_code == 200:
+			data = resp.json()
+			if data.get("results"):
+				return _parse_legacy_results(data)
+	except Exception as e:
+		if debug: print("Rankby request failed:", e)
+
+	# 3) Fallback: Places API v1 /places:searchNearby (POST)
+	try:
+		url_v1 = "https://places.googleapis.com/v1/places:searchNearby"
 		headers = {
 			"Content-Type": "application/json",
 			"X-Goog-Api-Key": api_key,
-			"X-Goog-FieldMask": "places.displayName,places.formattedAddress,places.location"
+			"X-Goog-FieldMask": "places.displayName,places.location,places.distanceMeters"
 		}
-		data = {
-			"includedTypes": ["subway_station"],
-			"maxResultCount": 3,
+		payload = {
+			"includedTypes": ["subway_station", "transit_station"],
+			"maxResultCount": max_results,
 			"rankPreference": "DISTANCE",
 			"locationRestriction": {
 				"circle": {
@@ -73,10 +183,37 @@ def get_nearest_mrts(lat, lng, api_key, radius=1000):
 				}
 			}
 		}
-		response = requests.post(url, headers=headers, json=data)
-		if response.status_code != 200:
-			return []
-		return [p["displayName"]["text"] for p in response.json().get("places", [])]
+		resp = requests.post(url_v1, headers=headers, json=payload, timeout=timeout)
+		if debug:
+			print("v1 searchNearby status:", resp.status_code)
+			# show message if not 200
+			if resp.status_code != 200:
+				try:
+					print("v1 response:", resp.json())
+				except Exception:
+					print("v1 non-json response")
+		if resp.status_code == 200:
+			data = resp.json()
+			places = data.get("places", [])
+			out = []
+			for p in places[:max_results]:
+				name = p.get("displayName", {}).get("text") or "Unknown"
+				dist = p.get("distanceMeters")
+				if dist is None:
+					loc = p.get("location", {}).get("latLng", {})
+					plat = loc.get("latitude"); plng = loc.get("longitude")
+					if plat is not None and plng is not None:
+						dist = _haversine_m(lat, lng, plat, plng)
+				out.append(f"{name} ({int(dist)} m)" if dist is not None else name)
+			if out:
+				return out
+	except Exception as e:
+		if debug: print("v1 request error:", e)
+
+	# nothing found
+	if debug:
+		print("All attempts exhausted. Attempts summary:", attempts)
+	return []
 
 def get_opening_hours(place_id, api_key):
 		url = f"https://places.googleapis.com/v1/places/{place_id}"
@@ -176,8 +313,15 @@ async def search_restaurant(update: Update, context: ContextTypes.DEFAULT_TYPE):
 			est_price = estimate_price_per_pax(price_level)
 	
 		# Get nearest MRTs
-		loc = place.get("location", {}).get("latLng", {})
-		lat, lng = loc.get("latitude"), loc.get("longitude")
+		loc = place.get("location", {})
+		lat_lng = loc.get("latLng", {})
+		lat = lat_lng.get("latitude")
+		lng = lat_lng.get("longitude")
+		
+		if lat is None or lng is None:
+			# Try a fallback if latLng missing
+			lat = loc.get("latitude")
+			lng = loc.get("longitude")
 		mrt_names = get_nearest_mrts(lat, lng, GOOGLE_API_KEY) if lat and lng else []
 		mrt_text = ", ".join(mrt_names) if mrt_names else "Unknown"
 	

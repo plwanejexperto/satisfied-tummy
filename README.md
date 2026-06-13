@@ -43,7 +43,7 @@ A Telegram bot for discovering, saving, and organising restaurants in Singapore.
 ```bash
 git clone https://github.com/your-username/satisfied-tummy-bot.git
 cd satisfied-tummy-bot
-pip install -r requirements.txt
+pip install python-telegram-bot pymongo requests python-dotenv certifi
 ```
 
 ### Environment Variables
@@ -69,12 +69,6 @@ python main.py
 The bot will log a MongoDB connectivity test on startup, then begin polling for messages.
 
 ## Dependencies
-
-Install with:
-
-```bash
-pip install python-telegram-bot pymongo requests python-dotenv certifi
-```
 
 | Package | Purpose |
 |---|---|

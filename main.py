@@ -40,6 +40,11 @@ def test_database_connection():
 
 test_database_connection()
 
+def escape_md_v2(text: str) -> str:
+	# Escape all characters that MarkdownV2 considers special
+	escape_chars = r"_*[]()~`>#+-=|{}.!\\"
+	return re.sub(f"([{re.escape(escape_chars)}])", r"\\\1", text)
+
 def estimate_price_per_pax(price_level):
 	mapping = {
 		0: "Unknown",
@@ -56,7 +61,7 @@ def reorder_opening_hours(weekday_text):
 	return weekday_text[today_index:] + weekday_text[:today_index]
 		
 def get_nearest_mrts(lat, lng, api_key, radius=2000, max_results=3, debug=False, timeout=8):
-		if not api_key or lat is None or lng is None:
+		if not pi_key or lat is None or lng is None:
 			return []
 		
 		from math import radians, cos, sin, asin, sqrt
@@ -162,6 +167,60 @@ def get_opening_hours(place_id, api_key):
 		data = r.json().get("regularOpeningHours", {}).get("weekdayDescriptions", [])
 		return data
 
+def format_opening_hours(opening_hours) -> str:
+		import re
+		
+		weekdays = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+		
+		# Convert list like ["Monday: 8AM–5PM", ...] → dict
+		if isinstance(opening_hours, list):
+			hours_dict = {}
+			for entry in opening_hours:
+				match = re.match(r"(?i)(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\s*[:\-]?\s*(.+)", entry.strip())
+				if match:
+					hours_dict[match.group(1).capitalize()] = match.group(2).strip()
+		else:
+			hours_dict = dict(opening_hours)
+		
+		# Normalize values by removing day prefixes carefully
+		cleaned = {}
+		for day in weekdays:
+			val = hours_dict.get(day, "Unknown")
+			val = re.sub(rf"^{day}\s*[:\-]?\s*", "", val.strip(), flags=re.IGNORECASE)
+			cleaned[day] = val.strip()
+		
+		hours_list = [cleaned.get(day, "Unknown") for day in weekdays]
+		
+		# Case 1: all same hours → "Daily: ..."
+		if all(h == hours_list[0] for h in hours_list):
+			return f"    Daily: {hours_list[0]}"
+		
+		# Case 2: group consecutive days with same hours
+		grouped = []
+		start_day = weekdays[0]
+		prev_hours = hours_list[0]
+		
+		for i in range(1, 7):
+			current_hours = hours_list[i]
+			if current_hours != prev_hours:
+				end_day = weekdays[i - 1]
+				if start_day == end_day:
+					grouped.append(f"{start_day}: {prev_hours}")
+				else:
+					grouped.append(f"{start_day} - {end_day}: {prev_hours}")
+				start_day = weekdays[i]
+				prev_hours = current_hours
+		
+		# Add last group
+		end_day = weekdays[6]
+		if start_day == end_day:
+			grouped.append(f"{start_day}: {prev_hours}")
+		else:
+			grouped.append(f"{start_day} - {end_day}: {prev_hours}")
+		
+		return "\n".join([f"    {line}" for line in grouped])
+
+
 def get_place_details(place_id, api_key):
 		url = f"https://places.googleapis.com/v1/places/{place_id}"
 		headers = {
@@ -178,17 +237,29 @@ def get_place_details(place_id, api_key):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 	await update.message.reply_text(
 		"👋 Welcome to *Satisfied Tummy Bot!*\n"
-		"Send me a restaurant name and I’ll find nearby results.\n\n"
-		"Commands:\n"
+		"Send me a restaurant name and I’ll find it! No commands required.\n\n"
+		"Other Commands:\n"
 		"• /listrestaurants – Show all saved restaurants\n"
-		"• /searchdb <keyword> – Search in saved list",
+		"• /search <keyword> – Search for tags in saved database\n"
+		"• /searchrest <keyword> – Search for specific restaurants saved db",
 		parse_mode="Markdown"	
 	)
 
-async def send_long_message(update, text, parse_mode=None):
+async def send_long_message(update, blocks, parse_mode="MarkdownV2"):
 	MAX_LEN = 4000
-	for i in range(0, len(text), MAX_LEN):
-		await update.message.reply_text(text[i:i+MAX_LEN], parse_mode=parse_mode)
+	buffer = ""
+	
+	for block in blocks:
+		entry = block + "\n\n"
+		if len(buffer) + len(entry) > MAX_LEN:
+			await update.message.reply_text(buffer, parse_mode=parse_mode)
+			buffer = ""
+		buffer += entry
+	
+	if buffer:
+		await update.message.reply_text(buffer, parse_mode=parse_mode)
+
+
 
 async def search_restaurant(update: Update, context: ContextTypes.DEFAULT_TYPE):
 	# DEBUG: log message arrival 
@@ -247,6 +318,8 @@ async def search_restaurant(update: Update, context: ContextTypes.DEFAULT_TYPE):
 	
 	reply_text = "🍽️ Nearby results:\n"
 	context.user_data["search_results"] = []
+	keyboard = []  
+	button_count = 0
 	for i, place in enumerate(filtered_results[:5]):
 		name = escape_markdown(place["displayName"]["text"])
 		addr = escape_markdown(place.get("formattedAddress", "Unknown"))
@@ -286,11 +359,22 @@ async def search_restaurant(update: Update, context: ContextTypes.DEFAULT_TYPE):
 		reservations = get_place_details(place["id"], GOOGLE_API_KEY)
 		reservations_text = "Yes" if reservations else "No"
 		hours = get_opening_hours(place["id"], GOOGLE_API_KEY)
-		hours_text = "\n".join(escape_markdown(h) for h in hours) if hours else "Unknown"
+		if hours:
+			simplified_hours = format_opening_hours(hours)
+			hours_text = escape_markdown(simplified_hours)
+		else:
+			hours_text = "Unknown"
+
 		if maps_url:
 			maps_md = f"[Maps Link]({maps_url})"
 		else:
 			maps_md = "No link available"
+			
+		existing = restaurants_collection.find_one({
+			"name": place["displayName"]["text"],
+			"address": place.get("formattedAddress", "Unknown")
+		})
+		
 		reply_text += (
 			f"\n{i+1}. 🏷️ *{name}*\n"
 			f"📍 {addr}\n"
@@ -319,18 +403,32 @@ async def search_restaurant(update: Update, context: ContextTypes.DEFAULT_TYPE):
 			},
 			"tags": [],
 		}
-		context.user_data["search_results"].append(restaurant_data) 
+		
+		if existing:
+			reply_text += "⚠️ *Already saved in database*\n"
+		else:
+			context.user_data["search_results"].append(restaurant_data)
+			idx_in_search_results = len(context.user_data["search_results"]) - 1  # real index
+			button_count += 1  # display count
+			keyboard.append([
+				InlineKeyboardButton(f"💾 Save #{i+1}", callback_data=f"save_restaurant_{idx_in_search_results}")
+			])
+
+
+	if keyboard:
+		keyboard.append([InlineKeyboardButton("💾 Save None", callback_data="save_restaurant_none")])
+		await update.message.reply_text(
+			reply_text,
+			parse_mode="Markdown",
+			reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None
+		)
+		return WAITING_SAVE
+	else:
+		await update.message.reply_text(reply_text, parse_mode="Markdown")
+		await update.message.reply_text("✅ All results are already in your database — nothing new to save.")
+		return None
 	
-	keyboard = [
-		[InlineKeyboardButton(f"💾 Save #{i+1}", callback_data=f"save_restaurant_{i}")]
-		for i in range(len(context.user_data["search_results"]))
-	]
-	await update.message.reply_text(
-		reply_text,
-		parse_mode="Markdown",
-		reply_markup=InlineKeyboardMarkup(keyboard)
-	)
-	return WAITING_SAVE
+	
 
 async def save_restaurant(update: Update, context: ContextTypes.DEFAULT_TYPE):
 	print("=== Handler: save_restaurant called ===")
@@ -342,6 +440,14 @@ async def save_restaurant(update: Update, context: ContextTypes.DEFAULT_TYPE):
 		print("callback answered")
 		# Extract which restaurant index to save
 		data = query.data  # e.g. "save_restaurant_0"
+		if query.data == "save_restaurant_none":
+			await query.message.reply_text(
+				"✅ No restaurants were saved. You can search again anytime."
+			)
+			# Clear any previous search results if you want
+			context.user_data["search_results"] = []
+			context.user_data["_conversation_state"] = None
+			return ConversationHandler.END  
 		match = re.match(r"save_restaurant_(\d+)", data)
 		if not match:
 			print("save_restaurant: invalid callback data:", query.data)
@@ -394,7 +500,7 @@ async def add_tags(update: Update, context: ContextTypes.DEFAULT_TYPE):
 		saved_restaurant_id = context.user_data.get("saved_restaurant_id")
 		print("saved_restaurant_id:", saved_restaurant_id)
 		
-		if tags_text.lower() == "/skip":
+		if tags_text.lower() in ("/skip", "skip"):
 			await update.message.reply_text("⏩ Skipped adding tags.")
 			context.user_data.pop("saved_restaurant_id", None)
 			print("User skipped tagging. Cleaned context.user_data")
@@ -434,16 +540,23 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --- DB COMMANDS ---	
 async def list_restaurants(update: Update, context: ContextTypes.DEFAULT_TYPE):
 	restaurants = list(restaurants_collection.find())
-	print("DB contents:", restaurants)  #debug statement
 	if not restaurants:
 		await update.message.reply_text("No restaurants saved yet.")
 		return
 	
-	response = "🍽️ *Saved Restaurants:*\n\n"
-	for r in restaurants:  # limit to first 10 for readability
-		response += f"• {r.get('name', 'Unnamed')} — {r.get('address', 'No address')}\n"
+	# Build lines of "Name — Address"
+	lines = []
+	for r in restaurants:
+		name = r.get("name", "Unnamed")
+		addr = r.get("address", "No address")
+		lines.append(f"• {name} — {addr}")
 	
-	await update.message.reply_text(response, parse_mode="Markdown")
+	# Send in chunks to avoid message too long error
+	chunk_size = 20  # lines per message, adjust if needed
+	for i in range(0, len(lines), chunk_size):
+		chunk_text = "\n".join(lines[i:i+chunk_size])
+		await update.message.reply_text(chunk_text)
+
 
 async def search_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
 	if not context.args:
@@ -464,7 +577,7 @@ async def search_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
 		await update.message.reply_text(f"No restaurants found for '{keyword}'.")
 		return
 	
-	response = f"🍽️ Results for *{escape_markdown(keyword, version=2)}*:\n\n"
+	restaurant_blocks = []  # <-- list of blocks, one per restaurant
 	for r in results:
 		name = escape_markdown(r.get('name', 'Unnamed'), version=2)
 		types = ", ".join(escape_markdown(t, version=2) for t in r.get('type', []))
@@ -473,33 +586,32 @@ async def search_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
 		mrts = ", ".join(escape_markdown(m, version=2) for m in r.get('nearest_mrts', []))
 		reservations = escape_markdown(r.get('reservations', 'Unknown'), version=2)
 		tags = ", ".join(escape_markdown(t, version=2) for t in r.get('tags', []))
-		
-		response += f"• *Name:* {name}\n"
-		response += f"  *Type:* {types}\n"
-		response += f"  *Rating:* {rating}\n"
-		response += f"  *Price per pax:* {price}\n"
-		response += f"  *Nearest MRTs:* {mrts}\n"
-		response += f"  *Reservations:* {reservations}\n"
-		
+		block = (
+			f"• *Name:* {name}\n"
+			f"  *Type:* {types}\n"
+			f"  *Rating:* {rating}\n"
+			f"  *Price per pax:* {price}\n"
+			f"  *Nearest MRTs:* {mrts}\n"
+			f"  *Reservations:* {reservations}\n"
+		)
+	
 		opening_hours = r.get('opening_hours', {})
 		if opening_hours:
-			weekdays = list(opening_hours.keys())
-			today_index = datetime.today().weekday()
-			tomorrow_index = (today_index + 1) % 7
-			
-			today_name = weekdays[today_index]
-			tomorrow_name = weekdays[tomorrow_index]
-			
-			today_hours = escape_markdown(opening_hours.get(today_name, 'Unknown'), version=2)
-			tomorrow_hours = escape_markdown(opening_hours.get(tomorrow_name, 'Unknown'), version=2)
-			
-			response += f"  *Opening Hours:*\n"
-			response += f"    Today: {today_hours}\n"
-			response += f"    Tomorrow: {tomorrow_hours}\n"
-		
-		response += f"  *Tags:* {tags}\n\n"
+			simplified_hours = format_opening_hours(opening_hours)
+			block += "  *Opening Hours:*\n"
+			for line in simplified_hours.splitlines():
+				if ":" in line:
+					day_part, time_part = line.split(":", 1)
+					block += f"    {escape_markdown(day_part.strip(), version=2)}: {escape_markdown(time_part.strip(), version=2)}\n"
+				else:
+					block += f"    {escape_markdown(line.strip(), version=2)}\n"
 	
-	await send_long_message(update, response, parse_mode="MarkdownV2")
+		block += f"  *Tags:* {tags}"
+		restaurant_blocks.append(block)
+	
+	# Send all restaurants in chunks
+	await send_long_message(update, restaurant_blocks, parse_mode="MarkdownV2")
+
 
 SEARCHING, WAITING_SAVE, WAITING_TAGS = range(3)
 
@@ -510,10 +622,12 @@ conv_handler = ConversationHandler(
 			MessageHandler(filters.TEXT & ~filters.COMMAND, search_restaurant)
 		],
 		WAITING_SAVE: [
-			CallbackQueryHandler(save_restaurant, pattern=r"^save_restaurant_\d+$")
+			#CallbackQueryHandler(save_restaurant, pattern=r"^save_restaurant_\d+$")
+			CallbackQueryHandler(save_restaurant),
 		],
 		WAITING_TAGS: [
 			MessageHandler(filters.TEXT & ~filters.COMMAND, add_tags)
+			#CommandHandler("skip", add_tags),
 		],
 	},
 	fallbacks=[CommandHandler("cancel", cancel)],
@@ -525,7 +639,7 @@ app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 app.add_handler(conv_handler)
 app.add_handler(CommandHandler("start", start))
 app.add_handler(CommandHandler("listrestaurants", list_restaurants))
-app.add_handler(CommandHandler("searchdb", search_db))
+app.add_handler(CommandHandler("search", search_db))
 app.add_handler(CommandHandler("cancel", cancel))
 
 

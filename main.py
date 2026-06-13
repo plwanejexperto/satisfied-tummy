@@ -8,36 +8,15 @@ gmaps = googlemaps.Client(key=os.getenv("GOOGLE_MAPS_API_KEY"))
 
 restaurant = input('Enter the restaurant name: ')
 search = gmaps.places(query=restaurant)
-place_id = search["results"][0]["place_id"]
-place_id2 = search["results"][1]["place_id"]
-#print(place_id)
+plocation_result = gmaps.geocode(restaurant)
+location = location_result[0]["geometry"]["location"]
+lat_lng = (location["lat"], location["lng"])
+print("Coordinates:", lat_lng)
+nearby_results = gmaps.places_nearby(
+	location=lat_lng,
+	radius=1000,  # in meters
+	keyword="mcdonalds"
+)
 
-details = gmaps.place(place_id=place_id, fields=["name", "formatted_address", "rating", "opening_hours", "price_level"])
-
-def estimate_price_per_pax(price_level):
-	mapping = {
-		0: "Unknown",
-		1: "Inexpensive (<$10 per pax)",
-		2: "Moderate ($10–$30 per pax)",
-		3: "Expensive ($30–$70 per pax)",
-		4: "Very Expensive (>$70 per pax)"
-	}
-	return mapping.get(price_level, "Unknown")
-
-result = details["result"]
-
-print("Name:", result["name"])
-print("Address:", result["formatted_address"])
-print("Rating:", result.get("rating"))
-print("Estimated price per pax:", estimate_price_per_pax(result.get("price_level", 0)))
-
-print()
-
-
-# Print all opening hours
-if "opening_hours" in result:
-	for line in result["opening_hours"]["weekday_text"]:
-		print(line)
-		
-details = gmaps.place(place_id=place_id2, fields=["name", "formatted_address", "rating", "opening_hours", "price_level"])
-print("Name:", result["name"])
+for i, place in enumerate(nearby_results.get("results", [])):
+	print(f"{i+1}. {place.get('name')} — {place.get('vicinity')}")
